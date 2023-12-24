@@ -39,6 +39,7 @@
 #include <tinyalsa/asoundlib.h>
 
 #include <audio_utils/resampler.h>
+#include <audio_utils/format.h>
 
 #include "audio_route.h"
 
@@ -118,7 +119,7 @@ struct stream_out {
 
     pthread_mutex_t lock; /* see note below on mutex acquisition order */
     struct pcm *pcm;
-    struct pcm_config *pcm_config;
+    struct pcm_config pcm_config;
     bool standby;
 
     struct resampler_itfe *resampler;
@@ -138,7 +139,7 @@ struct stream_in {
 
     pthread_mutex_t lock; /* see note below on mutex acquisition order */
     struct pcm *pcm;
-    struct pcm_config *pcm_config;
+    struct pcm_config pcm_config;
     bool standby;
 
     unsigned int requested_rate;
@@ -179,18 +180,82 @@ static void release_buffer(struct resampler_buffer_provider *buffer_provider,
 
 /* Helper functions */
 
-struct snd_pcm_info *select_card(unsigned int device, unsigned int flags)
+struct snd_pcm_info *select_card(unsigned int device, unsigned int flags, unsigned int routing)
 {
-    static struct snd_pcm_info *cached_info[4];
+    static struct snd_pcm_info *cached_info[7];
     struct snd_pcm_info *info;
-    int d = !!(flags & PCM_IN);
-    char e = d ? 'c' : 'p';
-    if (!cached_info[d] && !cached_info[d + 2]) {
+    int is_input = !!(flags & PCM_IN);
+    char e = is_input ? 'c' : 'p';
+
+    unsigned int headphone_on = routing & (AUDIO_DEVICE_OUT_WIRED_HEADSET |
+                                    AUDIO_DEVICE_OUT_WIRED_HEADPHONE); // out
+    unsigned int speaker_on = routing & AUDIO_DEVICE_OUT_SPEAKER; // out
+    unsigned int docked = routing & AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET; // out
+    unsigned int main_mic_on = routing & AUDIO_DEVICE_IN_BUILTIN_MIC; // in
+    unsigned int headset_mic_on = routing & AUDIO_DEVICE_IN_WIRED_HEADSET; // in
+
+    int d = 0;
+    // 12L, not 11, not 13, gives a weird state of no route on start when headphone is not plugged in
+    if(is_input){
+        if(!main_mic_on && !headset_mic_on){
+            main_mic_on = 1;
+        }
+        d = main_mic_on ? 3 : d;
+        d = headset_mic_on ? 4 : d;
+    }else{
+        if(!speaker_on && !headphone_on && !docked){
+            speaker_on = 1;
+        }
+        d = speaker_on ? 0 : d;
+        d = headphone_on ? 1 : d;
+        d = docked ? 2 : d;
+    }
+
+
+    int want_hdmi = property_get_bool("hal.audio.primary.hdmi", device == PCM_DEVICE_HDMI);
+
+    if (!cached_info[d] || (!cached_info[is_input + 5] && want_hdmi)) {
         struct dirent **namelist;
         char path[PATH_MAX] = "/dev/snd/";
         char prop[PROPERTY_VALUE_MAX];
         int n;
-        if (property_get(d ? "hal.audio.in" : "hal.audio.out", prop, NULL)) {
+        if (want_hdmi && property_get("hal.audio.out.hdmi", prop, NULL)) {
+            ALOGI("using hdmi specific card %s from property", prop);
+            namelist = malloc(sizeof(struct dirent *));
+            namelist[0] = calloc(1, sizeof(struct dirent));
+            strncpy(namelist[0]->d_name, prop, sizeof(namelist[0]->d_name) - 1);
+            n = 1;
+        } else if (!is_input && headphone_on && property_get("hal.audio.out.headphone", prop, NULL)) {
+            ALOGI("using headphone specific card %s from property", prop);
+            namelist = malloc(sizeof(struct dirent *));
+            namelist[0] = calloc(1, sizeof(struct dirent));
+            strncpy(namelist[0]->d_name, prop, sizeof(namelist[0]->d_name) - 1);
+            n = 1;
+        } else if (!is_input && speaker_on && property_get("hal.audio.out.speaker", prop, NULL)) {
+            ALOGI("using speaker specific card %s from property", prop);
+            namelist = malloc(sizeof(struct dirent *));
+            namelist[0] = calloc(1, sizeof(struct dirent));
+            strncpy(namelist[0]->d_name, prop, sizeof(namelist[0]->d_name) - 1);
+            n = 1;
+        } else if (!is_input && docked && property_get("hal.audio.out.dock", prop, NULL)) {
+            ALOGI("using dock specific card %s from property", prop);
+            namelist = malloc(sizeof(struct dirent *));
+            namelist[0] = calloc(1, sizeof(struct dirent));
+            strncpy(namelist[0]->d_name, prop, sizeof(namelist[0]->d_name) - 1);
+            n = 1;
+        } else if (is_input && main_mic_on && property_get("hal.audio.in.mic", prop, NULL)) {
+            ALOGI("using mic specific card %s from property", prop);
+            namelist = malloc(sizeof(struct dirent *));
+            namelist[0] = calloc(1, sizeof(struct dirent));
+            strncpy(namelist[0]->d_name, prop, sizeof(namelist[0]->d_name) - 1);
+            n = 1;
+        } else if (is_input && headset_mic_on && property_get("hal.audio.in.headset", prop, NULL)) {
+            ALOGI("using headset mic specific card %s from property", prop);
+            namelist = malloc(sizeof(struct dirent *));
+            namelist[0] = calloc(1, sizeof(struct dirent));
+            strncpy(namelist[0]->d_name, prop, sizeof(namelist[0]->d_name) - 1);
+            n = 1;
+        } else if (property_get(is_input ? "hal.audio.in" : "hal.audio.out", prop, NULL)) {
             ALOGI("using %s from property", prop);
             namelist = malloc(sizeof(struct dirent *));
             namelist[0] = calloc(1, sizeof(struct dirent));
@@ -208,18 +273,18 @@ struct snd_pcm_info *select_card(unsigned int device, unsigned int flags)
                     if ((fd = open(path, O_RDWR)) >= 0) {
                         info = malloc(sizeof(*info));
                         if (!ioctl(fd, SNDRV_PCM_IOCTL_INFO, info)) {
-                            if (info->stream == d && /* ignore IntelHDMI */
+                            if (info->stream == is_input && /* ignore IntelHDMI */
                                     !strstr((const char *)info->id, "IntelHDMI")) {
                                 ALOGD("found audio %s at %s\ncard: %d/%d id: %s\nname: %s\nsubname: %s\nstream: %d",
-                                        d ? "in" : "out", path,
+                                        is_input ? "in" : "out", path,
                                         info->card, info->device, info->id,
                                         info->name, info->subname, info->stream);
                                 int hdmi = (!!strcasestr((const char *)info->id, "HDMI")) * 2;
-                                if (cached_info[d + hdmi]) {
+                                if (cached_info[hdmi ? 5 + is_input : d]) {
                                     ALOGD("ignore %s", de->d_name);
                                     free(info);
                                 } else {
-                                    cached_info[d + hdmi] = info;
+                                    cached_info[hdmi ? 5 + is_input : d] = info;
                                 }
                             }
                         } else {
@@ -234,22 +299,109 @@ struct snd_pcm_info *select_card(unsigned int device, unsigned int flags)
             free(namelist);
         }
     }
-    if (property_get_bool("hal.audio.primary.hdmi", device == PCM_DEVICE_HDMI) && cached_info[d + 2]) {
-        info = cached_info[d + 2];
+    if (want_hdmi && cached_info[5 + is_input]) {
+        info = cached_info[5 + is_input];
     } else {
         info = cached_info[d] ? cached_info[d] : cached_info[d + 2];
     }
-    ALOGI_IF(info, "choose pcmC%dD%d%c for %d", info->card, info->device, d ? 'c' : 'p', device);
+    ALOGI_IF(info, "chose pcmC%dD%d%c for %d on cache slot %d", info->card, info->device, is_input ? 'c' : 'p', device, d);
     return info;
 }
 
-struct pcm *my_pcm_open(unsigned int device, unsigned int flags, struct pcm_config *config)
+int get_format_from_prop(const char *prop){
+    int format = property_get_int32(prop, PCM_FORMAT_S16_LE);
+    if(format != PCM_FORMAT_S16_LE && format != PCM_FORMAT_S32_LE && format != PCM_FORMAT_S8){
+        ALOGW("format %d from %s is ignored", format, prop);
+        format = PCM_FORMAT_S16_LE;
+    }
+    return format;
+}
+
+pthread_mutex_t prop_command_lock;
+int run_prop_command(const char *command){
+    pthread_mutex_lock(&prop_command_lock);
+    int ret = system(command);
+    pthread_mutex_unlock(&prop_command_lock);
+    return ret;
+}
+
+void last_ditch_card_and_format_adjustments(unsigned int routing, struct pcm_config *config, int is_input){
+    int want_hdmi = property_get_bool("hal.audio.primary.hdmi", !!(routing & AUDIO_DEVICE_OUT_AUX_DIGITAL));
+    unsigned int headphone_on = routing & (AUDIO_DEVICE_OUT_WIRED_HEADSET |
+                                    AUDIO_DEVICE_OUT_WIRED_HEADPHONE); // out
+    unsigned int speaker_on = routing & AUDIO_DEVICE_OUT_SPEAKER; // out
+    unsigned int docked = routing & AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET; // out
+    unsigned int main_mic_on = routing & AUDIO_DEVICE_IN_BUILTIN_MIC; // in
+    unsigned int headset_mic_on = routing & AUDIO_DEVICE_IN_WIRED_HEADSET; // in
+    char prop[PROPERTY_VALUE_MAX];
+
+    // 12L, not 11, not 13, gives a weird state of no route on start when headphone is not plugged in
+    if(is_input){
+        if(!main_mic_on && !headset_mic_on){
+            main_mic_on = 1;
+        }
+    }else{
+        if(!headphone_on && !speaker_on && !docked){
+            speaker_on = 1;
+        }
+    }
+
+    if(want_hdmi){
+        const char *command_key = is_input ? "hal.audio.in.hdmi.command" : "hal.audio.out.hdmi.command";
+        const char *format_key = is_input ? "hal.audio.in.hdmi.format" : "hal.audio.out.hdmi.format";
+        if (property_get(command_key, prop, NULL)) {
+            ALOGI("running bringup command {%s} for hdmi", prop);
+            run_prop_command(prop);
+        }
+        config->format = get_format_from_prop(format_key);
+    }
+    if (!is_input && headphone_on) {
+        if (property_get("hal.audio.out.headphone.command", prop, NULL)) {
+            ALOGI("running bringup command {%s} for headphone", prop);
+            run_prop_command(prop);
+        }
+        config->format = get_format_from_prop("hal.audio.out.headphone.format");
+    }
+    if (!is_input && speaker_on) {
+        if (property_get("hal.audio.out.speaker.command", prop, NULL)) {
+            ALOGI("running bringup command {%s} for speaker", prop);
+            run_prop_command(prop);
+        }
+        config->format = get_format_from_prop("hal.audio.out.speaker.format");
+    }
+    if (!is_input && docked) {
+        if (property_get("hal.audio.out.dock.command", prop, NULL)) {
+            ALOGI("running bringup command {%s} for dock", prop);
+            run_prop_command(prop);
+        }
+        config->format = get_format_from_prop("hal.audio.out.dock.format");
+    }
+    if (is_input && main_mic_on) {
+        if (property_get("hal.audio.in.mic.command", prop, NULL)) {
+            ALOGI("running bringup command {%s} for mic", prop);
+            run_prop_command(prop);
+        }
+        config->format = get_format_from_prop("hal.audio.in.mic.format");
+    }
+    if (is_input && headset_mic_on) {
+        if (property_get("hal.audio.in.headset.command", prop, NULL)) {
+            ALOGI("running bringup command {%s} for headset mic", prop);
+            run_prop_command(prop);
+        }
+        config->format = get_format_from_prop("hal.audio.in.headset.format");
+    }
+}
+
+struct pcm *my_pcm_open(unsigned int device, unsigned int flags, struct pcm_config *config, unsigned int routing)
 {
-    struct snd_pcm_info *info = select_card(device, flags);
+    struct snd_pcm_info *info = select_card(device, flags, routing);
     if (!info) {
         ALOGE("unable to find a sound card");
         return NULL;
     }
+
+    last_ditch_card_and_format_adjustments(routing, config, flags & PCM_IN);
+
     struct pcm *pcm = pcm_open(info->card, info->device, flags, config);
     if (pcm && !pcm_is_ready(pcm)) {
         ALOGE("my_pcm_open(%d) failed: %s", flags, pcm_get_error(pcm));
@@ -362,10 +514,10 @@ static int start_output_stream(struct stream_out *out)
      */
     if (adev->out_device & AUDIO_DEVICE_OUT_ALL_SCO) {
         device = PCM_DEVICE_SCO;
-        out->pcm_config = &pcm_config_sco;
+        out->pcm_config = pcm_config_sco;
     } else {
         device = (adev->out_device & AUDIO_DEVICE_OUT_AUX_DIGITAL) ? PCM_DEVICE_HDMI : PCM_DEVICE;
-        out->pcm_config = &pcm_config_out;
+        out->pcm_config = pcm_config_out;
         out->buffer_type = OUT_BUFFER_TYPE_UNKNOWN;
     }
 
@@ -379,15 +531,15 @@ static int start_output_stream(struct stream_out *out)
     if (adev->active_in) {
         struct stream_in *in = adev->active_in;
         pthread_mutex_lock(&in->lock);
-        if (((out->pcm_config->rate % 8000 == 0) &&
-                 (in->pcm_config->rate % 8000) != 0) ||
-                 ((out->pcm_config->rate % 11025 == 0) &&
-                 (in->pcm_config->rate % 11025) != 0))
+        if (((out->pcm_config.rate % 8000 == 0) &&
+                 (in->pcm_config.rate % 8000) != 0) ||
+                 ((out->pcm_config.rate % 11025 == 0) &&
+                 (in->pcm_config.rate % 11025) != 0))
             do_in_standby(in);
         pthread_mutex_unlock(&in->lock);
     }
 
-    out->pcm = my_pcm_open(device, PCM_OUT | PCM_NORESTART, out->pcm_config);
+    out->pcm = my_pcm_open(device, PCM_OUT | PCM_NORESTART, &(out->pcm_config), adev->out_device);
     if (!out->pcm) {
         return -ENODEV;
     } else if (!pcm_is_ready(out->pcm)) {
@@ -400,14 +552,14 @@ static int start_output_stream(struct stream_out *out)
      * If the stream rate differs from the PCM rate, we need to
      * create a resampler.
      */
-    if (out_get_sample_rate(&out->stream.common) != out->pcm_config->rate) {
+    if (out_get_sample_rate(&out->stream.common) != out->pcm_config.rate) {
         ret = create_resampler(out_get_sample_rate(&out->stream.common),
-                               out->pcm_config->rate,
-                               out->pcm_config->channels,
+                               out->pcm_config.rate,
+                               out->pcm_config.channels,
                                RESAMPLER_QUALITY_DEFAULT,
                                NULL,
                                &out->resampler);
-        out->buffer_frames = (pcm_config_out.period_size * out->pcm_config->rate) /
+        out->buffer_frames = (pcm_config_out.period_size * out->pcm_config.rate) /
                 out_get_sample_rate(&out->stream.common) + 1;
 
         out->buffer = malloc(pcm_frames_to_bytes(out->pcm, out->buffer_frames));
@@ -432,10 +584,10 @@ static int start_input_stream(struct stream_in *in)
      */
     if (adev->in_device & AUDIO_DEVICE_IN_ALL_SCO) {
         device = PCM_DEVICE_SCO;
-        in->pcm_config = &pcm_config_sco;
+        in->pcm_config = pcm_config_sco;
     } else {
         device = PCM_DEVICE;
-        in->pcm_config = &pcm_config_in;
+        in->pcm_config = pcm_config_in;
     }
 
     /*
@@ -448,15 +600,15 @@ static int start_input_stream(struct stream_in *in)
     if (adev->active_out) {
         struct stream_out *out = adev->active_out;
         pthread_mutex_lock(&out->lock);
-        if (((in->pcm_config->rate % 8000 == 0) &&
-                 (out->pcm_config->rate % 8000) != 0) ||
-                 ((in->pcm_config->rate % 11025 == 0) &&
-                 (out->pcm_config->rate % 11025) != 0))
+        if (((in->pcm_config.rate % 8000 == 0) &&
+                 (out->pcm_config.rate % 8000) != 0) ||
+                 ((in->pcm_config.rate % 11025 == 0) &&
+                 (out->pcm_config.rate % 11025) != 0))
             do_out_standby(out);
         pthread_mutex_unlock(&out->lock);
     }
 
-    in->pcm = my_pcm_open(device, PCM_IN, in->pcm_config);
+    in->pcm = my_pcm_open(device, PCM_IN, &(in->pcm_config), adev->in_device);
     if (!in->pcm) {
         return -ENODEV;
     } else if (!pcm_is_ready(in->pcm)) {
@@ -469,11 +621,11 @@ static int start_input_stream(struct stream_in *in)
      * If the stream rate differs from the PCM rate, we need to
      * create a resampler.
      */
-    if (in_get_sample_rate(&in->stream.common) != in->pcm_config->rate) {
+    if (in_get_sample_rate(&in->stream.common) != in->pcm_config.rate) {
         in->buf_provider.get_next_buffer = get_next_buffer;
         in->buf_provider.release_buffer = release_buffer;
 
-        ret = create_resampler(in->pcm_config->rate,
+        ret = create_resampler(in->pcm_config.rate,
                                in_get_sample_rate(&in->stream.common),
                                1,
                                RESAMPLER_QUALITY_DEFAULT,
@@ -481,7 +633,11 @@ static int start_input_stream(struct stream_in *in)
                                &in->resampler);
     }
     in->buffer_size = pcm_frames_to_bytes(in->pcm,
-                                          in->pcm_config->period_size);
+                                          in->pcm_config.period_size);
+    if(in->pcm_config.format == PCM_FORMAT_S8){
+        // make space for growing it to 16bit format
+        in->buffer_size = in->buffer_size * 2;
+    }
     in->buffer = malloc(in->buffer_size);
     in->frames_in = 0;
 
@@ -509,17 +665,30 @@ static int get_next_buffer(struct resampler_buffer_provider *buffer_provider,
     }
 
     if (in->frames_in == 0) {
+        unsigned int read_size = in->buffer_size;
+        if(in->pcm_config.format == PCM_FORMAT_S8){
+            read_size = read_size / 2;
+        }
         in->read_status = pcm_read(in->pcm,
                                    (void*)in->buffer,
-                                   in->buffer_size);
+                                   read_size);
         if (in->read_status != 0) {
             ALOGE("get_next_buffer() pcm_read error %d", in->read_status);
             buffer->raw = NULL;
             buffer->frame_count = 0;
             return in->read_status;
         }
-        in->frames_in = in->pcm_config->period_size;
-        if (in->pcm_config->channels == 2) {
+
+        // if not 16bit, make it 16bit
+        if(in->pcm_config.format == PCM_FORMAT_S32_LE){
+            memcpy_by_audio_format((void*)in->buffer, AUDIO_FORMAT_PCM_16_BIT, (void*)in->buffer, AUDIO_FORMAT_PCM_32_BIT, in->pcm_config.period_size * in->pcm_config.channels);
+        }
+        if(in->pcm_config.format == PCM_FORMAT_S8){
+            memcpy_by_audio_format((void*)in->buffer, AUDIO_FORMAT_PCM_16_BIT, (void*)in->buffer, AUDIO_FORMAT_PCM_8_BIT, in->pcm_config.period_size * in->pcm_config.channels);
+        }
+
+        in->frames_in = in->pcm_config.period_size;
+        if (in->pcm_config.channels == 2) {
             unsigned int i;
 
             /* Discard right channel */
@@ -530,7 +699,7 @@ static int get_next_buffer(struct resampler_buffer_provider *buffer_provider,
 
     buffer->frame_count = (buffer->frame_count > in->frames_in) ?
                                 in->frames_in : buffer->frame_count;
-    buffer->i16 = in->buffer + (in->pcm_config->period_size - in->frames_in);
+    buffer->i16 = in->buffer + (in->pcm_config.period_size - in->frames_in);
 
     return in->read_status;
 
@@ -768,6 +937,12 @@ static int out_set_parameters(struct audio_stream *stream, const char *kvpairs)
 
             adev->out_device = val;
             select_devices(adev);
+            // go into standby in case the route is on another card
+            pthread_mutex_lock(&out->lock);
+            if(!out->standby){
+                do_out_standby(out);
+            }
+            pthread_mutex_unlock(&out->lock);
         }
     }
     pthread_mutex_unlock(&adev->lock);
@@ -850,7 +1025,7 @@ static ssize_t out_write(struct audio_stream_out *stream, const void* buffer,
         else
             period_count = OUT_SHORT_PERIOD_COUNT;
 
-        out->write_threshold = out->pcm_config->period_size * period_count;
+        out->write_threshold = out->pcm_config.period_size * period_count;
         /* reset current threshold if exiting standby */
         if (out->buffer_type == OUT_BUFFER_TYPE_UNKNOWN)
             out->cur_write_threshold = out->write_threshold;
@@ -859,7 +1034,7 @@ static ssize_t out_write(struct audio_stream_out *stream, const void* buffer,
 
     /* Reduce number of channels, if necessary */
     if (popcount(out_get_channels(&stream->common)) >
-                 (int)out->pcm_config->channels) {
+                 (int)out->pcm_config.channels) {
         unsigned int i;
 
         /* Discard right channel */
@@ -871,7 +1046,7 @@ static ssize_t out_write(struct audio_stream_out *stream, const void* buffer,
     }
 
     /* Change sample rate, if necessary */
-    if (out_get_sample_rate(&stream->common) != out->pcm_config->rate) {
+    if (out_get_sample_rate(&stream->common) != out->pcm_config.rate) {
         out_frames = out->buffer_frames;
         out->resampler->resample_from_input(out->resampler,
                                             in_buffer, &in_frames,
@@ -883,7 +1058,7 @@ static ssize_t out_write(struct audio_stream_out *stream, const void* buffer,
 
     if (!sco_on) {
         int total_sleep_time_us = 0;
-        size_t period_size = out->pcm_config->period_size;
+        size_t period_size = out->pcm_config.period_size;
 
         /* do not allow more than out->cur_write_threshold frames in kernel
          * pcm driver buffer */
@@ -900,7 +1075,7 @@ static ssize_t out_write(struct audio_stream_out *stream, const void* buffer,
             if (kernel_frames > out->cur_write_threshold) {
                 int sleep_time_us =
                     (int)(((int64_t)(kernel_frames - out->cur_write_threshold)
-                                    * 1000000) / out->pcm_config->rate);
+                                    * 1000000) / out->pcm_config.rate);
                 if (sleep_time_us < MIN_WRITE_SLEEP_US)
                     break;
                 total_sleep_time_us += sleep_time_us;
@@ -941,7 +1116,19 @@ static ssize_t out_write(struct audio_stream_out *stream, const void* buffer,
         }
     }
 
-    ret = pcm_write(out->pcm, in_buffer, out_frames * frame_size);
+    if (out->pcm_config.format == PCM_FORMAT_S32_LE) {
+        unsigned int new_buffer_size = out_frames * frame_size * 2;
+        uint8_t resize_buffer[new_buffer_size];
+        memcpy_by_audio_format((void*)resize_buffer, AUDIO_FORMAT_PCM_32_BIT, (void*)in_buffer, AUDIO_FORMAT_PCM_16_BIT, out_frames * frame_size / 2);
+        ret = pcm_write(out->pcm, resize_buffer, new_buffer_size);
+    } else if(out->pcm_config.format == PCM_FORMAT_S8) {
+        unsigned int new_buffer_size = out_frames * frame_size / 2;
+        uint8_t resize_buffer[new_buffer_size];
+        memcpy_by_audio_format((void*)resize_buffer, AUDIO_FORMAT_PCM_8_BIT, (void*)in_buffer, AUDIO_FORMAT_PCM_16_BIT, out_frames * frame_size / 2);
+        ret = pcm_write(out->pcm, resize_buffer, new_buffer_size);
+    } else {
+        ret = pcm_write(out->pcm, in_buffer, out_frames * frame_size);
+    }
     if (ret == -EPIPE) {
         /* In case of underrun, don't sleep since we want to catch up asap */
         pthread_mutex_unlock(&out->lock);
@@ -1006,8 +1193,8 @@ static size_t in_get_buffer_size(const struct audio_stream *stream)
      * multiple of 16 frames, as audioflinger expects audio buffers to
      * be a multiple of 16 frames
      */
-    size = (in->pcm_config->period_size * in_get_sample_rate(stream)) /
-            in->pcm_config->rate;
+    size = (in->pcm_config.period_size * in_get_sample_rate(stream)) /
+            in->pcm_config.rate;
     size = ((size + 15) / 16) * 16;
 
     return size * audio_stream_in_frame_size(&in->stream);
@@ -1076,6 +1263,12 @@ static int in_set_parameters(struct audio_stream *stream, const char *kvpairs)
 
             adev->in_device = val;
             select_devices(adev);
+            // go into standby in case the route is on another card
+            pthread_mutex_lock(&in->lock);
+            if(!in->standby){
+                do_in_standby(in);
+            }
+            pthread_mutex_unlock(&in->lock);
         }
     }
     pthread_mutex_unlock(&adev->lock);
@@ -1210,7 +1403,6 @@ exit:
     return status;
 }
 
-
 static int adev_open_output_stream(struct audio_hw_device *dev,
                                    audio_io_handle_t handle __unused,
                                    audio_devices_t devices __unused,
@@ -1223,7 +1415,7 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
     struct stream_out *out;
     int ret;
 
-    if (!select_card(0, PCM_OUT))
+    if (!select_card(0, PCM_OUT, adev->out_device))
         return -ENODEV;
 
     out = (struct stream_out *)calloc(1, sizeof(struct stream_out));
@@ -1256,6 +1448,12 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
 
     out->standby = true;
 
+    int res = pthread_mutex_init(&(out->lock), NULL);
+    if(res != 0){
+        free(out);
+        return -ENOMEM;
+    }
+
     *stream_out = &out->stream;
     return 0;
 
@@ -1267,7 +1465,11 @@ static int adev_open_output_stream(struct audio_hw_device *dev,
 static void adev_close_output_stream(struct audio_hw_device *dev __unused,
                                      struct audio_stream_out *stream)
 {
+    struct stream_out *out = (struct stream_out *)stream;
     out_standby(&stream->common);
+
+    pthread_mutex_destroy(&(out->lock));
+
     free(stream);
 }
 
@@ -1399,7 +1601,13 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
     in->dev = adev;
     in->standby = true;
     in->requested_rate = config->sample_rate;
-    in->pcm_config = &pcm_config_in; /* default PCM config */
+    in->pcm_config = pcm_config_in; /* default PCM config */
+
+    int res = pthread_mutex_init(&(in->lock), NULL);
+    if(res != 0){
+        free(in);
+        return -ENOMEM;
+    }
 
     *stream_in = &in->stream;
     return 0;
@@ -1409,8 +1617,10 @@ static void adev_close_input_stream(struct audio_hw_device *dev __unused,
                                    struct audio_stream_in *stream)
 {
     struct stream_in *in = (struct stream_in *)stream;
-
     in_standby(&stream->common);
+
+    pthread_mutex_destroy(&(in->lock));
+
     free(stream);
 }
 
@@ -1424,6 +1634,9 @@ static int adev_close(hw_device_t *device)
     struct audio_device *adev = (struct audio_device *)device;
 
     audio_route_free(adev->ar);
+
+    pthread_mutex_destroy(&(adev->lock));
+    pthread_mutex_destroy(&prop_command_lock);
 
     free(device);
     return 0;
@@ -1466,6 +1679,17 @@ static int adev_open(const hw_module_t* module, const char* name,
 
     adev->out_device = AUDIO_DEVICE_OUT_SPEAKER;
     adev->in_device = AUDIO_DEVICE_IN_BUILTIN_MIC & ~AUDIO_DEVICE_BIT_IN;
+
+    int res = pthread_mutex_init(&(adev->lock), NULL);
+    if(res != 0){
+        free(adev);
+        return -ENOMEM;
+    }
+    res = pthread_mutex_init(&prop_command_lock, NULL);
+    if(res != 0){
+        free(adev);
+        return -ENOMEM;
+    }
 
     *device = &adev->hw_device.common;
 
