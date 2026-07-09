@@ -180,9 +180,75 @@ static void release_buffer(struct resampler_buffer_provider *buffer_provider,
 
 /* Helper functions */
 
+static struct snd_pcm_info *cached_info[10];
+
+static void clear_cached_info(void)
+{
+    int i;
+    for (i = 0; i < 10; i++) {
+        if (cached_info[i]) {
+            free(cached_info[i]);
+            cached_info[i] = NULL;
+        }
+    }
+}
+
+static int is_hdmi_pin_active(int card, int device)
+{
+    struct mixer *m = mixer_open(card);
+    if (m) {
+        char jack_name[64];
+        snprintf(jack_name, sizeof(jack_name), "HDMI/DP,pcm=%d Jack", device);
+        struct mixer_ctl *ctl = mixer_get_ctl_by_name(m, jack_name);
+        if (!ctl) {
+            snprintf(jack_name, sizeof(jack_name), "HDMI/DP, pcm=%d Jack", device);
+            ctl = mixer_get_ctl_by_name(m, jack_name);
+        }
+        if (!ctl && device == 3) {
+            snprintf(jack_name, sizeof(jack_name), "HDMI/DP Jack");
+            ctl = mixer_get_ctl_by_name(m, jack_name);
+        }
+        if (ctl) {
+            int val = mixer_ctl_get_value(ctl, 0);
+            ALOGV("is_hdmi_pin_active: card %d device %d mixer ctl '%s' = %d", card, device, jack_name, val);
+            if (val > 0) {
+                mixer_close(m);
+                return 1;
+            }
+        }
+        mixer_close(m);
+    }
+    char path[PATH_MAX];
+    char buf[512];
+    int i;
+    for (i = 0; i < 8; i++) {
+        snprintf(path, sizeof(path), "/proc/asound/card%d/eld#%d.%d", card, device, i);
+        FILE *f = fopen(path, "r");
+        if (!f && i == 0) {
+            snprintf(path, sizeof(path), "/proc/asound/card%d/eld#%d", card, device);
+            f = fopen(path, "r");
+        }
+        if (f) {
+            size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+            fclose(f);
+            if (n > 0) {
+                buf[n] = '\0';
+                if (strstr(buf, "monitor_present\t1") || strstr(buf, "monitor_present 1") ||
+                    strstr(buf, "connection_type\tHDMI") || strstr(buf, "connection_type HDMI") ||
+                    strstr(buf, "connection_type\tDisplayPort") || strstr(buf, "connection_type DisplayPort") ||
+                    strstr(buf, "connection_type\tDP") || strstr(buf, "connection_type DP") ||
+                    strstr(buf, "eld_valid\t1") || strstr(buf, "eld_valid 1")) {
+                    ALOGV("is_hdmi_pin_active: card %d device %d active via %s", card, device, path);
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 struct snd_pcm_info *select_card(unsigned int device, unsigned int flags, unsigned int routing)
 {
-    static struct snd_pcm_info *cached_info[7];
     struct snd_pcm_info *info;
     int is_input = !!(flags & PCM_IN);
     char e = is_input ? 'c' : 'p';
@@ -202,7 +268,7 @@ struct snd_pcm_info *select_card(unsigned int device, unsigned int flags, unsign
         }
         d = main_mic_on ? 3 : d;
         d = headset_mic_on ? 4 : d;
-    }else{
+    } else {
         if(!speaker_on && !headphone_on && !docked){
             speaker_on = 1;
         }
@@ -211,59 +277,40 @@ struct snd_pcm_info *select_card(unsigned int device, unsigned int flags, unsign
         d = docked ? 2 : d;
     }
 
+    char route_prop[PROPERTY_VALUE_MAX];
+    property_get("persist.audio.output.route", route_prop, "");
+    int is_explicit_speaker = (strcmp(route_prop, "speaker") == 0) || (strcmp(route_prop, "headphone") == 0);
+    int is_explicit_hdmi = (strcmp(route_prop, "hdmi") == 0);
+    int is_explicit_usb = (strcmp(route_prop, "usb") == 0);
 
-    int want_hdmi = property_get_bool("hal.audio.primary.hdmi", device == PCM_DEVICE_HDMI);
+    int want_hdmi = is_explicit_hdmi ||
+                    (!is_explicit_speaker && !is_explicit_usb && (
+                        property_get_bool("hal.audio.primary.hdmi", device == PCM_DEVICE_HDMI) ||
+                        (routing & (AUDIO_DEVICE_OUT_HDMI | AUDIO_DEVICE_OUT_HDMI_ARC))
+                    ));
+    int want_usb = is_explicit_usb ||
+                   (!is_explicit_speaker && !is_explicit_hdmi && (
+                       (routing & (AUDIO_DEVICE_OUT_USB_DEVICE | AUDIO_DEVICE_OUT_USB_HEADSET | AUDIO_DEVICE_OUT_USB_ACCESSORY))
+                   ));
+    int want_speaker = is_explicit_speaker || (!want_hdmi && !want_usb);
 
-    if (!cached_info[d] || (!cached_info[is_input + 5] && want_hdmi)) {
+    if ((is_explicit_hdmi && !cached_info[is_input + 5]) ||
+        (is_explicit_usb && !cached_info[is_input + 7]) ||
+        (is_explicit_speaker && !cached_info[d]) ||
+        !cached_info[d] || !cached_info[is_input + 5] || !cached_info[is_input + 7]) {
         struct dirent **namelist;
         char path[PATH_MAX] = "/dev/snd/";
-        char prop[PROPERTY_VALUE_MAX];
-        int n;
-        if (want_hdmi && property_get("hal.audio.out.hdmi", prop, NULL)) {
-            ALOGI("using hdmi specific card %s from property", prop);
-            namelist = malloc(sizeof(struct dirent *));
-            namelist[0] = calloc(1, sizeof(struct dirent));
-            strncpy(namelist[0]->d_name, prop, sizeof(namelist[0]->d_name) - 1);
-            n = 1;
-        } else if (!is_input && headphone_on && property_get("hal.audio.out.headphone", prop, NULL)) {
-            ALOGI("using headphone specific card %s from property", prop);
-            namelist = malloc(sizeof(struct dirent *));
-            namelist[0] = calloc(1, sizeof(struct dirent));
-            strncpy(namelist[0]->d_name, prop, sizeof(namelist[0]->d_name) - 1);
-            n = 1;
-        } else if (!is_input && speaker_on && property_get("hal.audio.out.speaker", prop, NULL)) {
-            ALOGI("using speaker specific card %s from property", prop);
-            namelist = malloc(sizeof(struct dirent *));
-            namelist[0] = calloc(1, sizeof(struct dirent));
-            strncpy(namelist[0]->d_name, prop, sizeof(namelist[0]->d_name) - 1);
-            n = 1;
-        } else if (!is_input && docked && property_get("hal.audio.out.dock", prop, NULL)) {
-            ALOGI("using dock specific card %s from property", prop);
-            namelist = malloc(sizeof(struct dirent *));
-            namelist[0] = calloc(1, sizeof(struct dirent));
-            strncpy(namelist[0]->d_name, prop, sizeof(namelist[0]->d_name) - 1);
-            n = 1;
-        } else if (is_input && main_mic_on && property_get("hal.audio.in.mic", prop, NULL)) {
-            ALOGI("using mic specific card %s from property", prop);
-            namelist = malloc(sizeof(struct dirent *));
-            namelist[0] = calloc(1, sizeof(struct dirent));
-            strncpy(namelist[0]->d_name, prop, sizeof(namelist[0]->d_name) - 1);
-            n = 1;
-        } else if (is_input && headset_mic_on && property_get("hal.audio.in.headset", prop, NULL)) {
-            ALOGI("using headset mic specific card %s from property", prop);
-            namelist = malloc(sizeof(struct dirent *));
-            namelist[0] = calloc(1, sizeof(struct dirent));
-            strncpy(namelist[0]->d_name, prop, sizeof(namelist[0]->d_name) - 1);
-            n = 1;
-        } else if (property_get(is_input ? "hal.audio.in" : "hal.audio.out", prop, NULL)) {
-            ALOGI("using %s from property", prop);
-            namelist = malloc(sizeof(struct dirent *));
-            namelist[0] = calloc(1, sizeof(struct dirent));
-            strncpy(namelist[0]->d_name, prop, sizeof(namelist[0]->d_name) - 1);
-            n = 1;
-        } else {
-            n = scandir(path, &namelist, NULL, alphasort);
-        }
+        char prop_hdmi[PROPERTY_VALUE_MAX] = "";
+        char prop_usb[PROPERTY_VALUE_MAX] = "";
+        char prop_spk[PROPERTY_VALUE_MAX] = "";
+        property_get("hal.audio.out.hdmi", prop_hdmi, "");
+        property_get("hal.audio.out.usb", prop_usb, "");
+        if (!is_input && headphone_on) property_get("hal.audio.out.headphone", prop_spk, "");
+        else if (!is_input) property_get("hal.audio.out.speaker", prop_spk, "");
+        else if (is_input && headset_mic_on) property_get("hal.audio.in.headset", prop_spk, "");
+        else property_get("hal.audio.in.mic", prop_spk, "");
+
+        int n = scandir(path, &namelist, NULL, alphasort);
         if (n >= 0) {
             int i, fd;
             for (i = 0; i < n; i++) {
@@ -273,19 +320,57 @@ struct snd_pcm_info *select_card(unsigned int device, unsigned int flags, unsign
                     if ((fd = open(path, O_RDWR)) >= 0) {
                         info = malloc(sizeof(*info));
                         if (!ioctl(fd, SNDRV_PCM_IOCTL_INFO, info)) {
-                            if (info->stream == is_input && /* ignore IntelHDMI */
+                            if (info->stream == is_input &&
                                     !strstr((const char *)info->id, "IntelHDMI")) {
                                 ALOGD("found audio %s at %s\ncard: %d/%d id: %s\nname: %s\nsubname: %s\nstream: %d",
                                         is_input ? "in" : "out", path,
                                         info->card, info->device, info->id,
                                         info->name, info->subname, info->stream);
-                                int hdmi = (!!strcasestr((const char *)info->id, "HDMI")) * 2;
-                                if (cached_info[hdmi ? 5 + is_input : d]) {
-                                    ALOGD("ignore %s", de->d_name);
-                                    free(info);
+                                int hdmi = (prop_hdmi[0] && !strcmp(de->d_name, prop_hdmi)) ||
+                                           (!!strcasestr((const char *)info->id, "HDMI") ||
+                                            !!strcasestr((const char *)info->name, "HDMI") ||
+                                            !!strcasestr((const char *)info->id, "DisplayPort") ||
+                                            !!strcasestr((const char *)info->name, "DisplayPort") ||
+                                            !!strcasestr((const char *)info->id, "DP") ||
+                                            info->device == 3 || info->device == 7 || info->device == 8 || info->device == 9);
+                                int usb = (!hdmi && ((prop_usb[0] && !strcmp(de->d_name, prop_usb)) ||
+                                                     !!strcasestr((const char *)info->id, "USB") ||
+                                                     !!strcasestr((const char *)info->name, "USB") ||
+                                                     info->card > 0));
+                                int slot = hdmi ? (5 + is_input) : (usb ? (7 + is_input) : d);
+                                if (cached_info[slot]) {
+                                    struct snd_pcm_info *old = cached_info[slot];
+                                    char old_pcm_name[32];
+                                    snprintf(old_pcm_name, sizeof(old_pcm_name), "pcmC%dD%d%c", old->card, old->device, e);
+                                    int is_exact_match = (hdmi && prop_hdmi[0] && !strcmp(de->d_name, prop_hdmi)) ||
+                                                         (usb && prop_usb[0] && !strcmp(de->d_name, prop_usb)) ||
+                                                         (!hdmi && !usb && prop_spk[0] && !strcmp(de->d_name, prop_spk));
+                                    int old_is_exact_match = (hdmi && prop_hdmi[0] && !strcmp(old_pcm_name, prop_hdmi)) ||
+                                                             (usb && prop_usb[0] && !strcmp(old_pcm_name, prop_usb)) ||
+                                                             (!hdmi && !usb && prop_spk[0] && !strcmp(old_pcm_name, prop_spk));
+                                    int new_active = hdmi ? is_hdmi_pin_active(info->card, info->device) : 0;
+                                    int old_active = hdmi ? is_hdmi_pin_active(old->card, old->device) : 0;
+                                    int prefer_new = is_exact_match || (!old_is_exact_match && (
+                                                        (hdmi && new_active && !old_active) ||
+                                                        (!new_active && old_active ? 0 : (
+                                                            (hdmi && info->device == 3 && old->device != 3) ||
+                                                            (info->card < old->card) ||
+                                                            (info->card == old->card && info->device < old->device)
+                                                        ))
+                                                     ));
+                                    if (prefer_new) {
+                                        ALOGD("replace slot %d (old %s) with %s (exact:%d pref:%d)", slot, old_pcm_name, de->d_name, is_exact_match, prefer_new);
+                                        free(cached_info[slot]);
+                                        cached_info[slot] = info;
+                                    } else {
+                                        ALOGD("ignore %s (slot %d kept %s)", de->d_name, slot, old_pcm_name);
+                                        free(info);
+                                    }
                                 } else {
-                                    cached_info[hdmi ? 5 + is_input : d] = info;
+                                    cached_info[slot] = info;
                                 }
+                            } else {
+                                free(info);
                             }
                         } else {
                             ALOGV("can't get info of %s", path);
@@ -299,12 +384,23 @@ struct snd_pcm_info *select_card(unsigned int device, unsigned int flags, unsign
             free(namelist);
         }
     }
-    if (want_hdmi && cached_info[5 + is_input]) {
+    if (is_explicit_hdmi && cached_info[5 + is_input]) {
         info = cached_info[5 + is_input];
+    } else if (is_explicit_usb && cached_info[7 + is_input]) {
+        info = cached_info[7 + is_input];
+    } else if (is_explicit_speaker && cached_info[d]) {
+        info = cached_info[d];
+    } else if (want_hdmi && cached_info[5 + is_input]) {
+        info = cached_info[5 + is_input];
+    } else if (want_usb && cached_info[7 + is_input]) {
+        info = cached_info[7 + is_input];
+    } else if (want_speaker && cached_info[d]) {
+        info = cached_info[d];
     } else {
-        info = cached_info[d] ? cached_info[d] : cached_info[d + 2];
+        info = cached_info[d] ? cached_info[d] : (cached_info[7 + is_input] ? cached_info[7 + is_input] : cached_info[5 + is_input]);
     }
-    ALOGI_IF(info, "chose pcmC%dD%d%c for %d on cache slot %d", info->card, info->device, is_input ? 'c' : 'p', device, d);
+    ALOGI_IF(info, "chose pcmC%dD%d%c for %d on cache slot %d (explicit_hdmi:%d explicit_usb:%d explicit_spk:%d)",
+             info->card, info->device, is_input ? 'c' : 'p', device, d, is_explicit_hdmi, is_explicit_usb, is_explicit_speaker);
     return info;
 }
 
@@ -402,6 +498,21 @@ struct pcm *my_pcm_open(unsigned int device, unsigned int flags, struct pcm_conf
 
     last_ditch_card_and_format_adjustments(routing, config, flags & PCM_IN);
 
+    if (!(flags & PCM_IN) && (info == cached_info[5] || info->device == 3 || info->device == 7 || info->device == 8 || info->device == 9)) {
+        if (!is_hdmi_pin_active(info->card, info->device)) {
+            unsigned int hdmi_pins[] = {7, 8, 9, 10, 3};
+            int p;
+            for (p = 0; p < 5; p++) {
+                if (hdmi_pins[p] == info->device) continue;
+                if (is_hdmi_pin_active(info->card, hdmi_pins[p])) {
+                    ALOGI("my_pcm_open: pin %d is active (Jack/ELD), switching from inactive pin %d on card %d", hdmi_pins[p], info->device, info->card);
+                    info->device = hdmi_pins[p];
+                    break;
+                }
+            }
+        }
+    }
+
     struct pcm *pcm = pcm_open(info->card, info->device, flags, config);
     if (pcm && !pcm_is_ready(pcm)) {
         ALOGE("my_pcm_open(%d) failed: %s", flags, pcm_get_error(pcm));
@@ -409,6 +520,27 @@ struct pcm *my_pcm_open(unsigned int device, unsigned int flags, struct pcm_conf
         ALOGI("my_pcm_open: re-try 44100 on card %d/%d", info->card, info->device);
         config->rate = 44100;
         pcm = pcm_open(info->card, info->device, flags, config);
+        if (!pcm || !pcm_is_ready(pcm)) {
+            if (pcm) pcm_close(pcm);
+            pcm = NULL;
+            if (!(flags & PCM_IN) && (info == cached_info[5] || info->device == 3 || info->device == 7 || info->device == 8 || info->device == 9)) {
+                unsigned int hdmi_pins[] = {3, 7, 8, 9, 10};
+                int p;
+                for (p = 0; p < 5; p++) {
+                    if (hdmi_pins[p] == info->device) continue;
+                    ALOGI("my_pcm_open: probing fallback HDMI pin %d on card %d", hdmi_pins[p], info->card);
+                    struct pcm *fallback_pcm = pcm_open(info->card, hdmi_pins[p], flags, config);
+                    if (fallback_pcm && pcm_is_ready(fallback_pcm)) {
+                        ALOGI("my_pcm_open: successfully opened fallback HDMI pin %d on card %d!", hdmi_pins[p], info->card);
+                        info->device = hdmi_pins[p];
+                        return fallback_pcm;
+                    }
+                    if (fallback_pcm) pcm_close(fallback_pcm);
+                }
+            }
+            ALOGW("my_pcm_open failed for card %d/%d, clearing cached_info to rescan", info->card, info->device);
+            clear_cached_info();
+        }
     }
     return pcm;
 }
@@ -421,10 +553,15 @@ static void select_devices(struct audio_device *adev)
     int main_mic_on;
     int headset_mic_on;
 
-    headphone_on = adev->out_device & (AUDIO_DEVICE_OUT_WIRED_HEADSET |
-                                    AUDIO_DEVICE_OUT_WIRED_HEADPHONE);
-    speaker_on = adev->out_device & AUDIO_DEVICE_OUT_SPEAKER;
-    docked = adev->out_device & AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET;
+    char route_prop[PROPERTY_VALUE_MAX];
+    property_get("persist.audio.output.route", route_prop, "");
+    int is_hdmi = (strcmp(route_prop, "hdmi") == 0) || (adev->out_device & AUDIO_DEVICE_OUT_HDMI);
+    int is_usb = (strcmp(route_prop, "usb") == 0) || (adev->out_device & (AUDIO_DEVICE_OUT_USB_DEVICE | AUDIO_DEVICE_OUT_USB_HEADSET | AUDIO_DEVICE_OUT_USB_ACCESSORY));
+
+    headphone_on = !is_hdmi && !is_usb && (adev->out_device & (AUDIO_DEVICE_OUT_WIRED_HEADSET |
+                                    AUDIO_DEVICE_OUT_WIRED_HEADPHONE));
+    speaker_on = !is_hdmi && !is_usb && ((adev->out_device & AUDIO_DEVICE_OUT_SPEAKER) || (strcmp(route_prop, "speaker") == 0));
+    docked = !is_hdmi && !is_usb && (adev->out_device & AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET);
     main_mic_on = adev->in_device & AUDIO_DEVICE_IN_BUILTIN_MIC;
     headset_mic_on = adev->in_device & AUDIO_DEVICE_IN_WIRED_HEADSET;
 
@@ -443,8 +580,9 @@ static void select_devices(struct audio_device *adev)
 
     update_mixer_state(adev->ar);
 
-    ALOGV("hp=%c speaker=%c dock=%c main-mic=%c headset-mic=%c", headphone_on ? 'y' : 'n',
-          speaker_on ? 'y' : 'n', docked ? 'y' : 'n', main_mic_on ? 'y' : 'n', headset_mic_on ? 'y' : 'n' );
+    ALOGV("hp=%c speaker=%c dock=%c main-mic=%c headset-mic=%c (hdmi=%c usb=%c)", headphone_on ? 'y' : 'n',
+          speaker_on ? 'y' : 'n', docked ? 'y' : 'n', main_mic_on ? 'y' : 'n', headset_mic_on ? 'y' : 'n',
+          is_hdmi ? 'y' : 'n', is_usb ? 'y' : 'n');
 }
 
 /* must be called with hw device and output stream mutexes locked */
@@ -913,37 +1051,46 @@ static int out_set_parameters(struct audio_stream *stream, const char *kvpairs)
     struct audio_device *adev = out->dev;
     struct str_parms *parms;
     char value[32];
-    int len;
+    int len, len_override;
     unsigned int val;
 
     parms = str_parms_create_str(kvpairs);
 
     len = str_parms_get_str(parms, AUDIO_PARAMETER_STREAM_ROUTING,
                             value, sizeof(value));
+    len_override = str_parms_get_str(parms, "routing_override",
+                            value, sizeof(value));
     pthread_mutex_lock(&adev->lock);
-    if (len >= 0) {
-        val = atoi(value);
-        if ((adev->out_device != val) && (val != 0)) {
-            /*
-             * If SCO is turned on/off, we need to put audio into standby
-             * because SCO uses a different PCM.
-             */
-            if ((val & AUDIO_DEVICE_OUT_ALL_SCO) ^
-                    (adev->out_device & AUDIO_DEVICE_OUT_ALL_SCO)) {
-                pthread_mutex_lock(&out->lock);
-                do_out_standby(out);
-                pthread_mutex_unlock(&out->lock);
+    if (len >= 0 || len_override >= 0) {
+        if (len_override >= 0) {
+            if (strcmp(value, "hdmi") == 0 || strcmp(value, "usb") == 0 || strcmp(value, "speaker") == 0) {
+                property_set("persist.audio.output.route", value);
             }
-
-            adev->out_device = val;
-            select_devices(adev);
-            // go into standby in case the route is on another card
-            pthread_mutex_lock(&out->lock);
-            if(!out->standby){
-                do_out_standby(out);
-            }
-            pthread_mutex_unlock(&out->lock);
         }
+        if (len >= 0) {
+            val = atoi(value);
+            if ((adev->out_device != val) && (val != 0)) {
+                /*
+                 * If SCO is turned on/off, we need to put audio into standby
+                 * because SCO uses a different PCM.
+                 */
+                if ((val & AUDIO_DEVICE_OUT_ALL_SCO) ^
+                        (adev->out_device & AUDIO_DEVICE_OUT_ALL_SCO)) {
+                    pthread_mutex_lock(&out->lock);
+                    do_out_standby(out);
+                    pthread_mutex_unlock(&out->lock);
+                }
+
+                adev->out_device = val;
+            }
+        }
+        select_devices(adev);
+        // go into standby in case the route is on another card
+        pthread_mutex_lock(&out->lock);
+        if (!out->standby) {
+            do_out_standby(out);
+        }
+        pthread_mutex_unlock(&out->lock);
     }
     pthread_mutex_unlock(&adev->lock);
 
@@ -1479,7 +1626,7 @@ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
     struct str_parms *parms;
     char *str;
     char value[32];
-    int ret;
+    int ret, len_override;
 
     parms = str_parms_create_str(kvpairs);
 
@@ -1489,6 +1636,24 @@ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
             adev->screen_off = false;
         else
             adev->screen_off = true;
+    }
+
+    len_override = str_parms_get_str(parms, "routing_override", value, sizeof(value));
+    if (len_override >= 0) {
+        if (strcmp(value, "hdmi") == 0 || strcmp(value, "usb") == 0 || strcmp(value, "speaker") == 0) {
+            property_set("persist.audio.output.route", value);
+        }
+        pthread_mutex_lock(&adev->lock);
+        clear_cached_info();
+        select_devices(adev);
+        if (adev->active_out) {
+            pthread_mutex_lock(&adev->active_out->lock);
+            if (!adev->active_out->standby) {
+                do_out_standby(adev->active_out);
+            }
+            pthread_mutex_unlock(&adev->active_out->lock);
+        }
+        pthread_mutex_unlock(&adev->lock);
     }
 
     str_parms_destroy(parms);

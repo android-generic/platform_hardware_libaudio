@@ -33,7 +33,7 @@
 #define MIXER_XML_PATH "/system/etc/mixer_paths.xml"
 #define INITIAL_MIXER_PATH_SIZE 8
 
-struct snd_pcm_info *select_card(unsigned int device __unused, unsigned int flags);
+struct snd_pcm_info *select_card(unsigned int device, unsigned int flags, unsigned int routing);
 
 struct mixer_state {
     struct mixer_ctl *ctl;
@@ -349,7 +349,7 @@ void update_mixer_state(struct audio_route *ar)
     unsigned int j;
 
     if (!ar) {
-        ALOGE("%s: invalid audio_route", __FUNCTION__);
+        ALOGV("%s: audio_route (mixer_paths.xml) bypassed/not loaded", __FUNCTION__);
         return;
     }
 
@@ -371,7 +371,7 @@ static void save_mixer_state(struct audio_route *ar)
     unsigned int i;
 
     if (!ar) {
-        ALOGE("%s: invalid audio_route", __FUNCTION__);
+        ALOGV("%s: audio_route (mixer_paths.xml) bypassed/not loaded", __FUNCTION__);
         return;
     }
 
@@ -387,7 +387,7 @@ void reset_mixer_state(struct audio_route *ar)
     unsigned int i;
 
     if (!ar) {
-        ALOGE("%s: invalid audio_route", __FUNCTION__);
+        ALOGV("%s: audio_route (mixer_paths.xml) bypassed/not loaded", __FUNCTION__);
         return;
     }
 
@@ -401,7 +401,7 @@ void audio_route_apply_path(struct audio_route *ar, const char *name)
     struct mixer_path *path;
 
     if (!ar) {
-        ALOGE("%s: invalid audio_route", __FUNCTION__);
+        ALOGV("%s: audio_route (mixer_paths.xml) bypassed/not loaded", __FUNCTION__);
         return;
     }
 
@@ -429,7 +429,7 @@ struct audio_route *audio_route_init(void)
     if (!ar)
         goto err_calloc;
 
-    struct snd_pcm_info *info = select_card(0, PCM_OUT);
+    struct snd_pcm_info *info = select_card(0, PCM_OUT, 0);
     if (!info) {
         ALOGW("Unable to find the mixer");
         goto err_mixer_open;
@@ -448,9 +448,26 @@ struct audio_route *audio_route_init(void)
     if (alloc_mixer_state(ar) < 0)
         goto err_mixer_state;
 
-    file = fopen(MIXER_XML_PATH, "r");
+    const char *candidate_paths[] = {
+        "/vendor/etc/mixer_paths_0.xml",
+        "/vendor/etc/mixer_paths.xml",
+        MIXER_XML_PATH,
+        "/etc/mixer_paths.xml",
+        "/vendor/etc/audio/mixer_paths.xml",
+        NULL
+    };
+    file = NULL;
+    const char *opened_path = MIXER_XML_PATH;
+    for (i = 0; candidate_paths[i]; i++) {
+        file = fopen(candidate_paths[i], "r");
+        if (file) {
+            opened_path = candidate_paths[i];
+            ALOGI("audio_route_init: successfully opened mixer paths XML at %s", opened_path);
+            break;
+        }
+    }
     if (!file) {
-        ALOGE("Failed to open %s", MIXER_XML_PATH);
+        ALOGI("audio_route_init: No mixer_paths XML found; bypassing mixer_paths routing and relying on kernel ALSA default switches.");
         goto err_fopen;
     }
 
